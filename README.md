@@ -107,12 +107,18 @@ TEAM_ID=team-xxxx TDAI_USER_ID=usr-xxxx ./kb.py register wiki-xxxx \
 
 实现要点：
 
+- **分拣用模型判断，不用关键词**（`--classifier llm`，默认）：每 10 条一批丢给 `glm-5.3-flash`，要它回 `{"items":[{"id","scope","why"}]}`，`scope ∈ personal|team|both|skip`。单批失败自动回落关键词，流水线不中断。
+- 团队 wiki 的**收口范围**：只收「资产 / 服务 / 仓库」，每条尽量给全三要素 —— 是什么（服务/容器/镜像/仓库名）、做什么用、跑在哪（主机/端口/域名/路径/仓库地址）。操作过程、排障细节、命令步骤、决策理由一律不进团队，留在个人 wiki。
 - 输入是 **L1 原子记忆**（`/v2/atomic/query`，必须同时给 `user_id`，只给 agent_id 会返回 0 条）。
-- 按 `type` + 基础设施关键词判定：`work_task` / `persona` 只进个人；`work_fact` 进团队；`episodic` / `instruction` 命中关键词则两边都进。
 - **团队版必须带来源**：文件头写 `来源：<AI 名字>（<agent_id>）；原始会话 <session>；采集时间 <日期>`，每条结论后跟 `（来源：<AI 名字> / 记忆 id）`。
-- 团队版默认用 GLM 改写（去人称、只留可复用配置与结论）。**模型只有 8K 输出上限时会返回空**——glm-5.3 单条任务就要烧 2000+ reasoning token，`max_tokens` 给到 30000 才稳；失败自动回落规则版，流水线不中断。
+- 团队版正文用 GLM 改写（`glm-5.3`）。**模型只有 8K 输出上限时会返回空**——glm-5.3 单条任务就要烧 2000+ reasoning token，`max_tokens` 给到 30000 才稳。
 - AI 名字映射放 `~/.config/tdai-wiki-pipeline/agents.json`（`{"agt-xxx": "小昔"}`），未登记的回落 agent_id。
 - 游标与已推 id 存 `~/.config/tdai-wiki-pipeline/state.json`，重复运行只处理新记忆。
+
+> **关于 JEV**：JEV 是 TDAI 内置的「System One」决策 provider（`tokenhub.tencentmaas.com/v1/systemone`
+> + `MEMORY_CORE_JEV_*` 配置），**不在 OpenCode Go 订阅池里** —— 实测 `model=jev` 返回
+> `Model jev isn't included in OpenCode Go`，池子里 29 个模型没有任何 jev。要用 JEV 得单独拿
+> TokenHub 的 key。所以这里的分拣用订阅池里的 `glm-5.3-flash`，效果等价、成本更低。
 
 ```bash
 # 先看分拣结果（不写任何东西）

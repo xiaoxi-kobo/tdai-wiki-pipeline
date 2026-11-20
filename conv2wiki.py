@@ -116,6 +116,96 @@ def classify(item: dict) -> tuple[bool, bool]:
     return True, infra
 
 
+# ── LLM 分拣（默认路径；关键词只做兜底）─────────────────────────────────
+# 2026-11-20 昊哥哥指出关键词判不准，改用模型判断。JEV 是 TDAI 内置的
+# 「System One」决策 provider（tokenhub.tencentmaas.com/v1/systemone），
+# 不在 OpenCode Go 订阅池里（实测 model=jev → 400 isn't included），
+# 所以这里用订阅池里的 glm-5.3-flash 做分拣（便宜、快、够用）。
+
+SCOPE_SYSTEM = (
+    "你是知识分拣器。判断每条记忆该进哪个 wiki，只输出 JSON，不要解释。\n"
+    "\n"
+    "team = 团队 wiki 只收「资产 / 服务 / 仓库」类事实，三要素：是什么、做什么用、跑在哪"
+    "（哪台机器 / 容器 / 端口 / 域名 / 路径 / 仓库地址）。典型：服务器上跑着哪些服务、"
+    "每个服务的用途与端口、容器名与镜像、域名与反代关系、仓库地址与它承载的项目。\n"
+    "\n"
+    "personal = 个人 wiki 收：个人任务、计划、待办、偏好、画像、写作/关系/健康/投资决策、"
+    "操作细节与排障过程、动机与理由、以及任何只有本人能推进的事。\n"
+    "\n"
+    "both = 同一条信息里既有「可复用的资产位置事实」又有「只属于我的细节/计划」，"
+    "两部分都值得分别记录。\n"
+    "\n"
+    "skip = 寒暄、无信息量、重复、与两者无关。\n"
+    "\n"
+    "判据优先级：先问「这条讲的是某个具体资产/服务/仓库在哪、干什么吗」→ 是则 team；"
+    "再问「这条讲的是我要做什么、我怎么想、我的偏好或过程吗」→ 是则 personal；都给 yes 就 both。\n"
+    "\n"
+    '输出格式：{"items":[{"id":"<原样照抄>","scope":"personal|team|both|skip","why":"≤15字"}]}'
+)
+
+SCOPE_MODEL_DEFAULT = "glm-5.3-flash"
+
+
+def _parse_json_loose(text: str) -> dict:
+    """模型偶尔会包 ```json 或加前后缀，尽量捞出第一个 JSON 对象。"""
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t)
+    start, end = t.find("{"), t.rfind("}")
+    if start >= 0 and end > start:
+        t = t[start:end + 1]
+    return json.loads(t)
+
+
+def classify_llm_batch(batch: list[dict]) -> dict[str, str]:
+    """一批（≤10 条）→ {id: scope}。失败抛异常由调用方兜底。"""
+    payload = "\n".join(
+        f'[{it.get("id")}] type={it.get("type") or "episodic"}｜{it.get("content") or ""}'
+        + (f'｜背景：{it.get("background")}' if it.get("background") else "")
+        for it in batch
+    )
+    model = os.environ.get("CONV2WIKI_SCOPE_MODEL") or SCOPE_MODEL_DEFAULT
+    raw = llm_chat(SCOPE_SYSTEM, f"共 {len(batch)} 条：\n\n{payload}", model=model, max_tokens=12000)
+    data = _parse_json_loose(raw)
+    out: dict[str, str] = {}
+    for row in data.get("items") or []:
+        rid, scope = row.get("id"), (row.get("scope") or "").strip().lower()
+        if rid and scope in ("personal", "team", "both", "skip"):
+            out[str(rid)] = scope
+    if len(out) < len(batch):
+        missing = [it.get("id") for it in batch if str(it.get("id")) not in out]
+        log(f"  分拣批次缺 {len(missing)} 条结果，缺的回落关键词判定")
+    return out
+
+
+def classify_all(items: list[dict], mode: str = "llm") -> dict[str, str]:
+    """→ {id: personal|team|both|skip}。mode=keyword 时完全走旧规则。"""
+    result: dict[str, str] = {}
+    if mode == "keyword":
+        for it in items:
+            p, t = classify(it)
+            result[str(it.get("id"))] = "both" if (p and t) else ("personal" if p else ("team" if t else "skip"))
+        return result
+
+    BATCH = 10
+    for i in range(0, len(items), BATCH):
+        batch = items[i:i + BATCH]
+        try:
+            got = classify_llm_batch(batch)
+        except Exception as e:  # noqa: BLE001 — 单批失败不影响整轮
+            log(f"  批次 {i // BATCH + 1} LLM 分拣失败，回落关键词：{e}")
+            got = {}
+        for it in batch:
+            rid = str(it.get("id"))
+            if rid in got:
+                result[rid] = got[rid]
+            else:
+                p, t = classify(it)
+                result[rid] = "both" if (p and t) else ("personal" if p else ("team" if t else "skip"))
+    return result
+
+
 # ── 生成 md ──────────────────────────────────────────────────────────────
 
 def agent_label(agent_id: str) -> str:
@@ -181,12 +271,17 @@ def build_team_md_llm(items: list[dict], day: str, agent_id: str, session: str) 
         f"[{it.get('id')}] type={it.get('type')}\n内容：{it.get('content')}\n背景：{it.get('background') or '-'}"
         for it in items)
     system = (
-        "你是运维知识整理助手。把给定的对话记忆条目整理成一篇团队知识库文档。"
-        "要求：1) 一律去掉第一人称与个人隐私（持仓、健康、感情、个人计划）；"
-        "2) 只保留可复用的配置、命令、端口/域名、故障原因与结论，写成陈述句；"
-        "3) 用 markdown：先给一篇「概览」段落，再按主题分小节；"
-        "4) 每条结论后面用括号标注来源，格式（来源：<AI 名字> / 记忆 id）；"
-        "5) 不要编造条目里没有的内容；6) 不要输出 frontmatter，正文从标题开始。"
+        "你是基础设施资产清单整理助手。把给定的记忆条目整理成一篇**团队资产/服务/仓库清单**。\n"
+        "只写这三类事实，每条尽量给出三要素：\n"
+        "1) 是什么（服务名 / 容器名 / 镜像 / 仓库名）；\n"
+        "2) 做什么用（一句话职责）；\n"
+        "3) 跑在哪（主机 / 端口 / 域名 / 挂载路径 / 仓库地址）。\n"
+        "硬性要求：\n"
+        "- 不收操作过程、排障细节、命令步骤、决策理由、个人计划与偏好（这些属于个人 wiki，不要写进来）；\n"
+        "- 一律去人称、去隐私，写成陈述句；\n"
+        "- 用 markdown：先一段「概览」，再按 服务 / 容器与镜像 / 域名与端口 / 仓库 分节，能用表格就用表格；\n"
+        "- 每条结论后面用括号标注来源，格式（来源：<AI 名字> / 记忆 id）；\n"
+        "- 不要编造条目里没有的内容；只输出正文，不要 frontmatter。"
     )
     prompt = (f"AI 名字：{label}（agent {agent_id}）\n会话：{session}\n日期：{day}\n\n以下是记忆条目：\n\n{bullet}")
     try:
@@ -217,18 +312,18 @@ def _dotenv(name: str) -> str:
     return ""
 
 
-def llm_chat(system: str, prompt: str) -> str:
+def llm_chat(system: str, prompt: str, model: str | None = None, max_tokens: int = 30000) -> str:
     # 注意：不要读通用名 LLM_API_KEY / LLM_BASE_URL —— 宿主环境里可能已有别的值（实测踩过 401）。
     # 覆盖一律用 CONV2WIKI_LLM_* 前缀，默认从 TDAI 部署 .env 取。
     base = (os.environ.get("CONV2WIKI_LLM_BASE_URL") or _dotenv("MEMORY_LLM_BASE_URL")).rstrip("/")
     key = os.environ.get("CONV2WIKI_LLM_API_KEY") or _dotenv("MEMORY_LLM_API_KEY")
-    model = os.environ.get("CONV2WIKI_LLM_MODEL") or _dotenv("KNOWLEDGE_LLM_MODEL") or "glm-5.3"
+    model = model or os.environ.get("CONV2WIKI_LLM_MODEL") or _dotenv("KNOWLEDGE_LLM_MODEL") or "glm-5.3"
     if not base or not key:
         raise SystemExit("缺 LLM_BASE_URL / LLM_API_KEY（从 .env 注入）")
     body = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        "max_tokens": 30000, "temperature": 0.3,
+        "max_tokens": max_tokens, "temperature": 0.3,
     }
     req = urllib.request.Request(base + "/chat/completions", data=json.dumps(body).encode(),
                                  headers={"content-type": "application/json", "authorization": "Bearer " + key,
@@ -263,6 +358,8 @@ def main() -> None:
     ap.add_argument("--apply", action="store_true", help="真的写 wiki 并触发 ingest")
     ap.add_argument("--dry-run", action="store_true", help="只打印分拣结果与生成的 md")
     ap.add_argument("--no-llm", action="store_true", help="团队版用规则改写，不调模型")
+    ap.add_argument("--classifier", default=os.environ.get("CONV2WIKI_CLASSIFIER", "llm"),
+                    choices=["llm", "keyword"], help="分拣方式：llm（默认，模型判断）/ keyword（旧规则兜底）")
     ap.add_argument("--limit", type=int, default=300)
     ap.add_argument("--since", default=None, help="ISO 时间，只处理此后的记忆（默认用本地游标）")
     ap.add_argument("--all", action="store_true", help="忽略游标，全量重跑")
@@ -286,15 +383,19 @@ def main() -> None:
         return
 
     personal, team, dual = [], [], []
+    scopes = classify_all(fresh, a.classifier)
+    skipped = 0
     for it in fresh:
-        p, t = classify(it)
-        if p and t:
+        sc = scopes.get(str(it.get("id")), "personal")
+        if sc == "both":
             dual.append(it)
-        elif p:
-            personal.append(it)
-        elif t:
+        elif sc == "team":
             team.append(it)
-    log(f"分拣：个人 {len(personal)} 条 / 团队 {len(team)} 条 / 两边都要 {len(dual)} 条")
+        elif sc == "personal":
+            personal.append(it)
+        else:
+            skipped += 1
+    log(f"分拣（{a.classifier}）：个人 {len(personal)} / 团队 {len(team)} / 两边 {len(dual)} / 跳过 {skipped}")
 
     day = (fresh[-1].get("created_at") or "")[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     p_items = personal + dual
