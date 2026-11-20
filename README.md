@@ -75,6 +75,26 @@ LLM_MODEL=glm-5.3     # ← 这里
 
 改完 `.env` 里的 `KNOWLEDGE_LLM_MODEL` 后要重跑 `start-memory-hub.sh`（env 在容器创建时固化）。
 
+## ⚠️ 纯 API 建 wiki 必须补 `register` 三步
+
+面板里建 wiki 能注入、你 API 建的却永远注入不出来，原因在这里：
+
+1. **meta 资产**：面板建 wiki 时会在 create 阶段顺手打 `/v3/meta/asset/create`。纯 API 建不会，于是 meta 里根本没有这个资产，`agent-fixed-asset` 绑不上，注入器自然看不到。
+2. **内核明细**：KS 编译完成后回调 Panel，Panel 再写 `/v3/knowledge/create`，body 里的 `user_id` 取的是 `detail.owner_user_id`。**如果建 wiki 时没传 `user_id`，owner 就是 null，这一步会被 zod 拒掉**（`400 user_id: Invalid input: expected string, received null`），明细缺失 → 注入器同样跳过。
+3. **status**：meta asset 的合法状态是 `draft|candidate|approved|deprecated|archived|failed`，没有 `active`；建完建议置 `approved`。
+
+所以 API 路线收尾必须：
+
+```bash
+TEAM_ID=team-xxxx TDAI_USER_ID=usr-xxxx ./kb.py register wiki-xxxx \
+  --summary "一句话摘要（≤250 字，注入块里显示的就是它）" \
+  --bind agt-xxxxxxxx        # 绑给哪个 agent，可跟多个
+```
+
+`register` 是幂等的：asset 存在就跳过 create 并置 approved，然后写内核明细、绑 agent，最后回显该 agent 当前的 `llm_wiki` 绑定列表。
+
+需要 admin key（meta 用）与 user key（`x-tdai-user-key`），分别从 `$TDAI_ADMIN_KEY` / `.admin-key`、`$TDAI_USER_KEY` / hermes config 的 `sk-mem-*` 读取。
+
 ## 权限模型（重要）
 
 - 写权限**只有一把全局 service key**，没有「只读某几个 wiki」的粒度 —— 谁拿到 key 谁就能改删全部 wiki。

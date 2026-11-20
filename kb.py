@@ -94,7 +94,12 @@ def cmd_list(a: argparse.Namespace) -> None:
 
 
 def cmd_create(a: argparse.Namespace) -> None:
-    data = call("/wiki/create", {"team_id": a.team, "name": a.name}, auth=True)
+    body: dict[str, Any] = {"team_id": a.team, "name": a.name}
+    # user_id 决定 owner_user_id；不传会导致后续内核明细同步被 zod 拒掉（400 user_id null）
+    user = a.user or os.environ.get("TDAI_USER_ID", "")
+    if user:
+        body["user_id"] = user
+    data = call("/wiki/create", body, auth=True)
     print(data.get("wiki_id", ""))
 
 
@@ -155,13 +160,117 @@ def cmd_pages(a: argparse.Namespace) -> None:
 
 
 def cmd_read(a: argparse.Namespace) -> None:
-    data = call("/wiki/page/read", {"wiki_id": a.wiki_id, "path": a.page}, auth=False)
-    print(data.get("content") or json.dumps(data, ensure_ascii=False)[:2000])
+    data = call("/wiki/page/read", {"wiki_id": a.wiki_id, "refs": a.page}, auth=False)
+    for it in data.get("items") or []:
+        print(f"# {it.get('ref') or it.get('path')}\n")
+        print(it.get("content") or "")
 
 
 def cmd_search(a: argparse.Namespace) -> None:
     data = call("/wiki/search", {"wiki_id": a.wiki_id, "query": a.query, "top_k": a.top_k}, auth=False)
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+# ── meta 侧登记：KS 建 wiki ≠ 出现在注入里 ────────────────────────────────
+# Panel 建 wiki 时会在 create 阶段顺手打 /v3/meta/asset/create；纯 API 建的 wiki
+# 没有这一步，结果就是「页面都在、面板也能看，但 agent 预热时永远注入不出来」。
+# 而且 callback 写内核明细 /v3/knowledge/create 时带的是 detail.owner_user_id，
+# 为 null 会被 zod 拒掉（400 user_id: expected string, received null）→ 明细缺失
+# → 注入器同样跳过。所以 API 路线必须自己补三步。
+
+def resolve_admin_key() -> str:
+    key = os.environ.get("TDAI_ADMIN_KEY", "").strip()
+    if key:
+        return key
+    path = os.environ.get("TDAI_ADMIN_KEY_FILE", "/home/ubuntu/TencentDB-Agent-Memory/deploy/global-images/.admin-key")
+    p = Path(path)
+    if p.is_file():
+        try:
+            return p.read_text().strip()
+        except PermissionError:
+            import subprocess
+            return subprocess.check_output(["sudo", "-n", "cat", path]).decode().strip()
+    raise SystemExit("找不到 admin key（$TDAI_ADMIN_KEY 或 .admin-key 文件）")
+
+
+def resolve_user_key() -> str:
+    key = os.environ.get("TDAI_USER_KEY", "").strip()
+    if key:
+        return key
+    cfg = Path(os.environ.get("HERMES_CONFIG", "/home/ubuntu/.hermes/config.yaml"))
+    if cfg.is_file():
+        m = re.search(r"api_key:\s*(sk-mem-\S+)", cfg.read_text())
+        if m:
+            return m.group(1)
+    raise SystemExit("找不到 user key（$TDAI_USER_KEY 或 hermes config 的 sk-mem-*）")
+
+
+def meta_call(path: str, body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+    url = os.environ.get("CORE_URL", "http://127.0.0.1:8420").rstrip("/") + path
+    headers = {
+        "content-type": "application/json",
+        "authorization": "Bearer " + resolve_admin_key(),
+        "x-tdai-service-id": os.environ.get("SERVICE_ID", "default"),
+        "x-tdai-user-key": resolve_user_key(),
+    }
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        payload = {"code": e.code, "message": e.read().decode()[:400]}
+    if payload.get("code") not in (0, None):
+        raise SystemExit(f"{path} 失败: code={payload.get('code')} {payload.get('message')}")
+    return payload.get("data") or {}
+
+
+def cmd_register(a: argparse.Namespace) -> None:
+    detail = call("/wiki/get", {"wiki_id": a.wiki_id}, auth=False)
+    name = detail.get("name") or a.wiki_id
+    user = a.user or os.environ.get("TDAI_USER_ID", "")
+    if not user:
+        raise SystemExit("缺少 user_id：用 --user 或 $TDAI_USER_ID")
+    team = detail.get("team_id") or a.team
+    service_url = detail.get("service_url")
+    if not service_url:
+        raise SystemExit("wiki 缺 service_url（KS 的 KNOWLEDGE_PUBLIC_BASE_URL 没配？）")
+
+    # asset/create 不是 upsert：重复登记会 500 internal_error。先查后建。
+    existing = None
+    try:
+        existing = meta_call("/v3/meta/asset/get", {"asset_id": a.wiki_id})
+    except SystemExit:
+        existing = None
+    if existing:
+        log("meta asset 已存在，跳过 create")
+        meta_call("/v3/meta/asset/update", {"asset_id": a.wiki_id, "status": "approved"})
+        log("meta asset 置为 approved")
+    else:
+        meta_call("/v3/meta/asset/create", {
+            "asset_id": a.wiki_id, "team_id": team, "asset_type": "llm_wiki",
+            "name": name, "owner_user_id": user, "source_type": "manual",
+            "description": a.description or name, "status": "approved",
+        })
+        log("meta asset 已登记")
+
+    summary = a.summary or f"{detail.get('page_count') or 0} 页知识库：{name}"
+    meta_call("/v3/knowledge/create", {
+        "knowledge_id": a.wiki_id, "type": "wiki", "service_url": service_url,
+        "name": name, "summary": summary[:250], "team_id": team, "user_id": user,
+    })
+    log("内核明细已写入")
+
+    for agent in a.bind or []:
+        meta_call("/v3/meta/agent-fixed-asset/set", {
+            "agent_id": agent,
+            "bindings": [{"asset_id": a.wiki_id, "asset_type": "llm_wiki", "created_by": user}],
+        })
+        log(f"已绑定到 agent {agent}")
+        detail_items = meta_call("/v3/meta/agent-fixed-asset/list-with-detail", {
+            "agent_id": agent, "page": 1, "page_size": 50, "asset_types": ["llm_wiki"],
+        })
+        got = [(i.get("asset_id"), i.get("name")) for i in (detail_items.get("items") or [])]
+        print(f"  {agent} 当前 llm_wiki 绑定: {got}")
 
 
 def main() -> None:
@@ -171,7 +280,12 @@ def main() -> None:
 
     sub.add_parser("list").set_defaults(fn=cmd_list)
 
-    p = sub.add_parser("create"); p.add_argument("name"); p.set_defaults(fn=cmd_create)
+    p = sub.add_parser("create"); p.add_argument("name"); p.add_argument("--user"); p.set_defaults(fn=cmd_create)
+
+    p = sub.add_parser("register"); p.add_argument("wiki_id")
+    p.add_argument("--user"); p.add_argument("--summary"); p.add_argument("--description")
+    p.add_argument("--bind", nargs="*", metavar="AGENT_ID")
+    p.set_defaults(fn=cmd_register)
 
     p = sub.add_parser("status"); p.add_argument("wiki_id"); p.set_defaults(fn=cmd_status)
 
@@ -186,7 +300,7 @@ def main() -> None:
 
     p = sub.add_parser("pages"); p.add_argument("wiki_id"); p.set_defaults(fn=cmd_pages)
 
-    p = sub.add_parser("read"); p.add_argument("wiki_id"); p.add_argument("--page", required=True)
+    p = sub.add_parser("read"); p.add_argument("wiki_id"); p.add_argument("--page", nargs="+", required=True)
     p.set_defaults(fn=cmd_read)
 
     p = sub.add_parser("search"); p.add_argument("wiki_id"); p.add_argument("query")
