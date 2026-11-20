@@ -261,11 +261,19 @@ def cmd_register(a: argparse.Namespace) -> None:
     log("内核明细已写入")
 
     for agent in a.bind or []:
-        meta_call("/v3/meta/agent-fixed-asset/set", {
-            "agent_id": agent,
-            "bindings": [{"asset_id": a.wiki_id, "asset_type": "llm_wiki", "created_by": user}],
+        # agent-fixed-asset/set 是「整表替换」语义，不是 append：必须先读现有绑定再合并，
+        # 否则第二次绑新 wiki 会把上一个 wiki 顶掉（2026-11-20 踩过）。
+        cur = meta_call("/v3/meta/agent-fixed-asset/list", {
+            "agent_id": agent, "page": 1, "page_size": 100,
         })
-        log(f"已绑定到 agent {agent}")
+        bindings = [
+            {"asset_id": i.get("asset_id"), "asset_type": i.get("asset_type"), "created_by": user}
+            for i in (cur.get("items") or [])
+            if i.get("asset_id") and i.get("asset_id") != a.wiki_id
+        ]
+        bindings.append({"asset_id": a.wiki_id, "asset_type": "llm_wiki", "created_by": user})
+        meta_call("/v3/meta/agent-fixed-asset/set", {"agent_id": agent, "bindings": bindings})
+        log(f"已绑定到 agent {agent}（合并后共 {len(bindings)} 条）")
         detail_items = meta_call("/v3/meta/agent-fixed-asset/list-with-detail", {
             "agent_id": agent, "page": 1, "page_size": 50, "asset_types": ["llm_wiki"],
         })

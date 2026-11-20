@@ -95,6 +95,36 @@ TEAM_ID=team-xxxx TDAI_USER_ID=usr-xxxx ./kb.py register wiki-xxxx \
 
 需要 admin key（meta 用）与 user key（`x-tdai-user-key`），分别从 `$TDAI_ADMIN_KEY` / `.admin-key`、`$TDAI_USER_KEY` / hermes config 的 `sk-mem-*` 读取。
 
+## conv2wiki.py — 把对话沉淀自动分拣进两座 wiki
+
+分拣规则（本人拍板，2026-11-20）：
+
+| 类别 | 判据 | 去哪 |
+|---|---|---|
+| 个人任务 / 计划 / 偏好 / 画像 | 只有本人能推进的事 | **个人 wiki**（原文 + 背景） |
+| 基础设施事实 | 服务器配置、跑着哪些服务、端口/域名/容器/证书/cron/备份… | **团队 wiki**（去人称 + 来源块） |
+| 同一信息的深浅两版 | 上面两类天然重叠 | 两边都写，**内容与细节不同** |
+
+实现要点：
+
+- 输入是 **L1 原子记忆**（`/v2/atomic/query`，必须同时给 `user_id`，只给 agent_id 会返回 0 条）。
+- 按 `type` + 基础设施关键词判定：`work_task` / `persona` 只进个人；`work_fact` 进团队；`episodic` / `instruction` 命中关键词则两边都进。
+- **团队版必须带来源**：文件头写 `来源：<AI 名字>（<agent_id>）；原始会话 <session>；采集时间 <日期>`，每条结论后跟 `（来源：<AI 名字> / 记忆 id）`。
+- 团队版默认用 GLM 改写（去人称、只留可复用配置与结论）。**模型只有 8K 输出上限时会返回空**——glm-5.3 单条任务就要烧 2000+ reasoning token，`max_tokens` 给到 30000 才稳；失败自动回落规则版，流水线不中断。
+- AI 名字映射放 `~/.config/tdai-wiki-pipeline/agents.json`（`{"agt-xxx": "小昔"}`），未登记的回落 agent_id。
+- 游标与已推 id 存 `~/.config/tdai-wiki-pipeline/state.json`，重复运行只处理新记忆。
+
+```bash
+# 先看分拣结果（不写任何东西）
+./conv2wiki.py --dry-run --limit 40
+
+# 真跑：推源 + 触发 ingest
+PERSONAL_WIKI_ID=wiki-xxx TEAM_WIKI_ID=wiki-yyy ./conv2wiki.py --apply
+```
+
+> ⚠️ `agent-fixed-asset/set` 是**整表替换**语义。绑第二个 wiki 时必须先读现有绑定再合并，
+> 否则上一个 wiki 会被顶掉（`kb.py register` 已处理这件事）。
+
 ## 权限模型（重要）
 
 - 写权限**只有一把全局 service key**，没有「只读某几个 wiki」的粒度 —— 谁拿到 key 谁就能改删全部 wiki。
