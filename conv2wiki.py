@@ -135,9 +135,12 @@ SCOPE_SYSTEM = (
     "both = 同一条信息里既有「可复用的资产位置事实」又有「只属于我的细节/计划」，"
     "两部分都值得分别记录。\n"
     "\n"
+    "howto = 操作方法 / 步骤 / 流程 / 命令序列 / 怎么运维 / 怎么排障 —— 这类归 skill，不进任何 wiki。\n"
+    "\n"
     "skip = 寒暄、无信息量、重复、与两者无关。\n"
     "\n"
-    "判据优先级：先问「这条讲的是某个具体资产/服务/仓库在哪、干什么吗」→ 是则 team；"
+    "判据优先级：先问「这条讲的是怎么做的吗（步骤/流程/命令）」→ 是则 howto；"
+    "再问「这条讲的是某个具体资产/服务/仓库在哪、干什么吗」→ 是则 team；"
     "再问「这条讲的是我要做什么、我怎么想、我的偏好或过程吗」→ 是则 personal；都给 yes 就 both。\n"
     "\n"
     '输出格式：{"items":[{"id":"<原样照抄>","scope":"personal|team|both|skip","why":"≤15字"}]}'
@@ -171,7 +174,7 @@ def classify_llm_batch(batch: list[dict]) -> dict[str, str]:
     out: dict[str, str] = {}
     for row in data.get("items") or []:
         rid, scope = row.get("id"), (row.get("scope") or "").strip().lower()
-        if rid and scope in ("personal", "team", "both", "skip"):
+        if rid and scope in ("personal", "team", "both", "skip", "howto"):
             out[str(rid)] = scope
     if len(out) < len(batch):
         missing = [it.get("id") for it in batch if str(it.get("id")) not in out]
@@ -382,7 +385,7 @@ def main() -> None:
         print("没有新记忆，什么都不用做。")
         return
 
-    personal, team, dual = [], [], []
+    personal, team, dual, howto = [], [], [], []
     scopes = classify_all(fresh, a.classifier)
     skipped = 0
     for it in fresh:
@@ -393,9 +396,15 @@ def main() -> None:
             team.append(it)
         elif sc == "personal":
             personal.append(it)
+        elif sc == "howto":
+            howto.append(it)
         else:
             skipped += 1
-    log(f"分拣（{a.classifier}）：个人 {len(personal)} / 团队 {len(team)} / 两边 {len(dual)} / 跳过 {skipped}")
+    log(f"分拣（{a.classifier}）：个人 {len(personal)} / 团队 {len(team)} / 两边 {len(dual)} / 归 skill {len(howto)} / 跳过 {skipped}")
+    if howto:
+        log("  ↓ 以下属「怎么做」，不进 wiki，留给 skill 沉淀：")
+        for it in howto[:15]:
+            log(f"    - {str(it.get('content') or '')[:60]}…")
 
     day = (fresh[-1].get("created_at") or "")[:10] or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     p_items = personal + dual
